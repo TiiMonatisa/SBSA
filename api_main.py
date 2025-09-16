@@ -41,7 +41,7 @@ def dc_list_projects():
     last_resp = None
     for ver in ("2", "3"):
         url = f"{dc_base_url}/rest/api/{ver}/project"
-        resp = requests.get(url, headers=headers, auth=dc_auth, timeout=60)
+        resp = requests.get(url, headers=headers, auth=dc_auth, timeout=60, verify=False)
         last_resp = resp
         if resp.status_code == 200:
             projects = resp.json()
@@ -70,7 +70,7 @@ def dc_search_issue_keys_for_project(project_id: str, project_key_for_logs: str,
     while True:
         params = {"jql": jql, "startAt": start_at, "maxResults": page_size, "fields": "key"}
         url = f"{dc_base_url}/rest/api/2/search"
-        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90)
+        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90, verify=False)
         if resp.status_code != 200:
             # Be lenient: log and skip the project instead of crashing the whole run
             print(f"[{project_key_for_logs}] DC search failed: {resp.status_code} {resp.text[:300]}... Skipping.")
@@ -97,7 +97,7 @@ def dc_iter_status_changes(issue_key: str):
     for ver in ("2", "3"):
         url = f"{dc_base_url}/rest/api/{ver}/issue/{issue_key}"
         params = {"expand": "changelog", "fields": "summary"}
-        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90)
+        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90, verify=False)
         if resp.status_code == 200:
             break
     if resp is None or resp.status_code != 200:
@@ -145,7 +145,7 @@ def cloud_fetch_status_pairs(issue_key: str):
 
     while True:
         params = {"startAt": start_at, "maxResults": max_results}
-        resp = requests.get(url, headers=headers, auth=cloud_auth, params=params, timeout=90)
+        resp = requests.get(url, headers=headers, auth=cloud_auth, params=params, timeout=90, verify=False)
         if resp.status_code != 200:
             print(f"Cloud changelog fetch for {issue_key} returned {resp.status_code}. Treating as empty.")
             return pairs
