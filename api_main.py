@@ -6,7 +6,7 @@ from requests.auth import HTTPBasicAuth
 from tqdm import tqdm
 from collections import defaultdict
 from dotenv import load_dotenv
-import argparse  # <-- needed
+import argparse
 
 # =========================
 # === Configurable bits ===
@@ -41,9 +41,8 @@ def dc_list_projects():
     last_resp = None
     for ver in ("2", "3"):
         url = f"{dc_base_url}/rest/api/{ver}/project"
-        print(url)
-        resp = requests.get(url, headers=headers, auth=dc_auth, timeout=60, verify='opt/aws-tools.standardbank.pem')
-        print(resp)
+        resp = requests.get(url, headers=headers, auth=dc_auth, timeout=60,
+                            verify='/opt/aws-tools.standardbank.co.za.pem')
         last_resp = resp
         if resp.status_code == 200:
             projects = resp.json()
@@ -72,9 +71,9 @@ def dc_search_issue_keys_for_project(project_id: str, project_key_for_logs: str,
     while True:
         params = {"jql": jql, "startAt": start_at, "maxResults": page_size, "fields": "key"}
         url = f"{dc_base_url}/rest/api/2/search"
-        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90, verify='opt/aws-tools.standardbank.pem')
+        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90,
+                            verify='/opt/aws-tools.standardbank.co.za.pem')
         if resp.status_code != 200:
-            # Be lenient: log and skip the project instead of crashing the whole run
             print(f"[{project_key_for_logs}] DC search failed: {resp.status_code} {resp.text[:300]}... Skipping.")
             return []
 
@@ -99,7 +98,8 @@ def dc_iter_status_changes(issue_key: str):
     for ver in ("2", "3"):
         url = f"{dc_base_url}/rest/api/{ver}/issue/{issue_key}"
         params = {"expand": "changelog", "fields": "summary"}
-        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90, verify='opt/aws-tools.standardbank.pem')
+        resp = requests.get(url, headers=headers, auth=dc_auth, params=params, timeout=90,
+                            verify='/opt/aws-tools.standardbank.co.za.pem')
         if resp.status_code == 200:
             break
     if resp is None or resp.status_code != 200:
@@ -133,8 +133,31 @@ def dc_iter_status_changes(issue_key: str):
                 }
 
 # =========================
-# === Cloud helper      ===
+# === Cloud helpers     ===
 # =========================
+
+def cloud_project_exists(project_key: str, project_id: str) -> bool:
+    """
+    Check whether project exists in Cloud.
+    Tries key first, then ID. No verify (Cloud uses valid certs).
+    """
+    for identifier in (project_key, project_id):
+        url = f"{cloud_base_url}/rest/api/3/project/{identifier}"
+        try:
+            resp = requests.get(url, headers=headers, auth=cloud_auth, timeout=60)
+        except requests.exceptions.RequestException as e:
+            print(f"[{project_key}] Cloud check transport error: {e}")
+            return False
+
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 404:
+            continue  # try next identifier
+        print(f"[{project_key}] Cloud project check returned {resp.status_code}: {resp.text[:200]}")
+        return False
+
+    print(f"[{project_key}] Project not found in Cloud by key or ID.")
+    return False
 
 def cloud_fetch_status_pairs(issue_key: str):
     """
@@ -147,14 +170,18 @@ def cloud_fetch_status_pairs(issue_key: str):
 
     while True:
         params = {"startAt": start_at, "maxResults": max_results}
-        resp = requests.get(url, headers=headers, auth=cloud_auth, params=params, timeout=90, verify='opt/aws-tools.standardbank.pem')
+        try:
+            resp = requests.get(url, headers=headers, auth=cloud_auth, params=params, timeout=90)
+        except requests.exceptions.RequestException as e:
+            print(f"Cloud changelog fetch for {issue_key} transport error: {e}. Treating as empty.")
+            return pairs
+
         if resp.status_code != 200:
             print(f"Cloud changelog fetch for {issue_key} returned {resp.status_code}. Treating as empty.")
             return pairs
 
         payload = resp.json()
         histories = payload.get("values", []) or payload.get("histories", [])
-
         for hist in histories:
             for item in hist.get("items", []):
                 if item.get("field") == "status":
@@ -171,14 +198,12 @@ def cloud_fetch_status_pairs(issue_key: str):
 # =========================
 
 def process_project(project_key: str, project_id: str, updated_since_days: int | None):
-    """
-    For a single project:
-    - fetch all DC issue keys
-    - gather DC status changes
-    - gather Cloud pairs
-    - write <project_key>.csv (fresh each run)
-    """
     print(f"\n=== Processing project: {project_key} (ID {project_id}) ===")
+
+    if not cloud_project_exists(project_key, project_id):
+        write_csv(project_key, [])
+        print(f"[{project_key}] ❎ Skipped. Project not found in Cloud. (Wrote empty CSV with headers.)")
+        return
 
     issue_keys = dc_search_issue_keys_for_project(project_id, project_key, updated_since_days)
     if not issue_keys:
@@ -186,7 +211,6 @@ def process_project(project_key: str, project_id: str, updated_since_days: int |
         write_csv(project_key, [])
         return
 
-    # Build DC transitions
     print(f"[{project_key}] Fetching DC changelogs for {len(issue_keys)} issue(s)...")
     dc_transitions_by_issue = defaultdict(list)
     for key in tqdm(issue_keys, desc=f"DC changelogs {project_key}"):
@@ -199,13 +223,11 @@ def process_project(project_key: str, project_id: str, updated_since_days: int |
         write_csv(project_key, [])
         return
 
-    # Cloud cache
     print(f"[{project_key}] Fetching Cloud changelogs...")
     cloud_cache = {}
     for key in tqdm(dc_transitions_by_issue.keys(), desc=f"Cloud changelogs {project_key}"):
         cloud_cache[key] = cloud_fetch_status_pairs(key)
 
-    # Compare
     print(f"[{project_key}] Comparing transitions...")
     missing_rows = []
     for key, entries in tqdm(dc_transitions_by_issue.items(), desc=f"Validating {project_key}"):
@@ -231,10 +253,6 @@ def process_project(project_key: str, project_id: str, updated_since_days: int |
     print(f"[{project_key}] ✅ Done. Missing transitions: {len(missing_rows)}")
 
 def write_csv(project_key: str, rows: list):
-    """
-    Always (re)write a fresh CSV per project:
-    ./project_csvs/<PROJECT_KEY>.csv
-    """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{project_key}.csv")
     fieldnames = ["issueKey", "transition", "from_status", "to_status", "author", "timestamp"]
@@ -258,9 +276,8 @@ def main():
                         help="Only include issues updated in the last N days (reduces payload).")
     args = parser.parse_args()
 
-    # Discover projects
     print("Discovering projects from Jira DC...")
-    all_projects = dc_list_projects()  # list of dicts with key/id/name
+    all_projects = dc_list_projects()
 
     if args.only:
         wanted = {k.upper() for k in args.only}
@@ -271,7 +288,6 @@ def main():
     else:
         projects = all_projects
 
-    # Case-insensitive resume logic
     start_index = 0
     if args.resume_from:
         resume_key = args.resume_from.upper()
@@ -280,10 +296,8 @@ def main():
                 start_index = i
                 break
         else:
-            print(f"Resume key '{args.resume_from}' not found in project list. "
-                  f"Proceeding from the beginning.")
+            print(f"Resume key '{args.resume_from}' not found in project list. Proceeding from the beginning.")
 
-    # Run from start_index onward
     for p in projects[start_index:]:
         process_project(project_key=p["key"], project_id=p["id"], updated_since_days=args.updated_since_days)
 
