@@ -93,6 +93,7 @@ def dc_search_issue_keys_for_project(project_id: str, project_key_for_logs: str,
 def dc_iter_status_changes(issue_key: str):
     """
     Yield status-change events for a DC issue using expand=changelog.
+    Also provides the DC issue id and the history (changegroup) id as changeitem_Id.
     """
     resp = None
     for ver in ("2", "3"):
@@ -107,6 +108,7 @@ def dc_iter_status_changes(issue_key: str):
         return
 
     data = resp.json()
+    dc_issue_id = str(data.get("id") or "")
     changelog = data.get("changelog", {}) or {}
     histories = changelog.get("histories", []) or []
     total = changelog.get("total")
@@ -121,15 +123,18 @@ def dc_iter_status_changes(issue_key: str):
                   or author_obj.get("emailAddress")
                   or "Unknown")
         created = history.get("created", "")
+        history_id = str(history.get("id") or "")
 
         for item in history.get("items", []):
             if item.get("field") == "status":
                 yield {
                     "issueKey": issue_key,
+                    "dcIssueId": dc_issue_id,
                     "fromStatus": {"name": item.get("fromString"), "id": item.get("from")},
                     "toStatus": {"name": item.get("toString"), "id": item.get("to")},
                     "author": author,
                     "timestamp": created,
+                    "changeitem_Id": history_id,  # <-- history/changegroup id
                 }
 
 # =========================
@@ -193,6 +198,23 @@ def cloud_fetch_status_pairs(issue_key: str):
 
     return pairs
 
+def cloud_get_issue_id(issue_key: str) -> str:
+    """
+    Return the Jira Cloud issue id for a given issue key.
+    """
+    url = f"{cloud_base_url}/rest/api/3/issue/{issue_key}"
+    params = {"fields": "id"}  # minimal payload
+    try:
+        resp = requests.get(url, headers=headers, auth=cloud_auth, params=params, timeout=60)
+    except requests.exceptions.RequestException as e:
+        print(f"Cloud issue id fetch for {issue_key} transport error: {e}.")
+        return ""
+    if resp.status_code != 200:
+        print(f"Cloud issue id fetch for {issue_key} returned {resp.status_code}.")
+        return ""
+    data = resp.json()
+    return str(data.get("id") or "")
+
 # =========================
 # === Per-project run   ===
 # =========================
@@ -213,10 +235,13 @@ def process_project(project_key: str, project_id: str, updated_since_days: int |
 
     print(f"[{project_key}] Fetching DC changelogs for {len(issue_keys)} issue(s)...")
     dc_transitions_by_issue = defaultdict(list)
+    dc_issue_id_map = {}
     for key in tqdm(issue_keys, desc=f"DC changelogs {project_key}"):
         for change in dc_iter_status_changes(key):
             if change["fromStatus"]["name"] and change["toStatus"]["name"]:
                 dc_transitions_by_issue[key].append(change)
+                if key not in dc_issue_id_map:
+                    dc_issue_id_map[key] = change.get("dcIssueId", "")
 
     if not dc_transitions_by_issue:
         print(f"[{project_key}] No DC status transitions found. Writing empty CSV with headers.")
@@ -225,8 +250,10 @@ def process_project(project_key: str, project_id: str, updated_since_days: int |
 
     print(f"[{project_key}] Fetching Cloud changelogs...")
     cloud_cache = {}
+    cloud_issue_id_map = {}
     for key in tqdm(dc_transitions_by_issue.keys(), desc=f"Cloud changelogs {project_key}"):
         cloud_cache[key] = cloud_fetch_status_pairs(key)
+        cloud_issue_id_map[key] = cloud_get_issue_id(key)
 
     print(f"[{project_key}] Comparing transitions...")
     missing_rows = []
@@ -240,11 +267,14 @@ def process_project(project_key: str, project_id: str, updated_since_days: int |
             transition_str = f"{f_name} \u2192 {t_name}"
             row = {
                 "issueKey": key,
+                "dc_issue_id": dc_issue_id_map.get(key, ""),
+                "cloud_issue_id": cloud_issue_id_map.get(key, ""),
                 "transition": transition_str,
                 "from_status": f"{f_name} ({f_id})",
                 "to_status": f"{t_name} ({t_id})",
                 "author": entry.get("author", "Unknown"),
                 "timestamp": entry.get("timestamp", ""),
+                "changeitem_Id": entry.get("changeitem_Id", ""),  # NEW COLUMN
             }
             if (f_name, t_name) not in cloud_pairs:
                 missing_rows.append(row)
@@ -255,7 +285,17 @@ def process_project(project_key: str, project_id: str, updated_since_days: int |
 def write_csv(project_key: str, rows: list):
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{project_key}.csv")
-    fieldnames = ["issueKey", "transition", "from_status", "to_status", "author", "timestamp"]
+    fieldnames = [
+        "issueKey",
+        "dc_issue_id",
+        "cloud_issue_id",
+        "transition",
+        "from_status",
+        "to_status",
+        "author",
+        "timestamp",
+        "changeitem_Id",  # <-- NEW header
+    ]
 
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
