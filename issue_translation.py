@@ -62,6 +62,8 @@ def load_dotenv(path: Path) -> None:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
 
         key, value = line.split("=", 1)
         key = key.strip()
@@ -89,13 +91,18 @@ def parse_ssl_verify(value: str) -> Union[bool, str]:
 
 
 def parse_args() -> argparse.Namespace:
+    default_output = env("ISSUE_TRANSLATION_CSV")
+    if not default_output:
+        output_dir = env("OUTPUT_DIR")
+        default_output = str(Path(output_dir) / CSV_OUTPUT_FILE) if output_dir else CSV_OUTPUT_FILE
+
     parser = argparse.ArgumentParser(
         description="Export Jira issue key, DC issue id, and Cloud issue id by matching on issue key."
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=int(env("ISSUE_TRANSLATION_WORKERS", "4") or "4"),
+        default=int(env("ISSUE_TRANSLATION_WORKERS", env("THREADS", "4")) or "4"),
         help="Number of parallel Jira search workers. Default: 4.",
     )
     parser.add_argument(
@@ -106,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default=env("ISSUE_TRANSLATION_CSV", CSV_OUTPUT_FILE),
+        default=default_output,
         help=f"CSV output path. Default: {CSV_OUTPUT_FILE}.",
     )
     parser.add_argument(
@@ -284,6 +291,10 @@ def enqueue_pages(
 
 
 def setup_cache(path: str) -> sqlite3.Connection:
+    cache_parent = Path(path).parent
+    if str(cache_parent) != ".":
+        cache_parent.mkdir(parents=True, exist_ok=True)
+
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("DROP TABLE IF EXISTS dc_issues")
@@ -388,6 +399,10 @@ def export_cloud_translation(config: Dict[str, Any]) -> Tuple[int, int]:
     cache_connection = sqlite3.connect(config["cache_file"])
     written = 0
     missing_dc = 0
+
+    output_parent = Path(config["output_file"]).parent
+    if str(output_parent) != ".":
+        output_parent.mkdir(parents=True, exist_ok=True)
 
     with open(config["output_file"], mode="w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
