@@ -5,10 +5,11 @@ import queue
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from requests.auth import HTTPBasicAuth
+from urllib3.exceptions import InsecureRequestWarning
 
 
 ENV_FILE = Path(".env")
@@ -102,6 +103,11 @@ def parse_args() -> argparse.Namespace:
         default=env("ISSUE_TRANSLATION_JQL", DEFAULT_JQL),
         help=f"JQL for issue selection. Default: {DEFAULT_JQL!r}.",
     )
+    parser.add_argument(
+        "--ssl-verify",
+        default=env("SSL_VERIFY", "True"),
+        help="TLS verification: True, False, or path to a .pem certificate bundle.",
+    )
     return parser.parse_args()
 
 
@@ -117,6 +123,7 @@ def require_config(args: argparse.Namespace) -> Dict[str, Any]:
         "jql": args.jql,
         "page_size": max(args.page_size, 1),
         "workers": max(args.workers, 1),
+        "ssl_verify": parse_ssl_verify(args.ssl_verify),
     }
 
     missing = [
@@ -136,6 +143,16 @@ def require_config(args: argparse.Namespace) -> Dict[str, Any]:
 
     config["cloud_base_url"] = config["cloud_base_url"].rstrip("/")
     return config
+
+
+def parse_ssl_verify(value: str) -> Union[bool, str]:
+    cleaned = value.strip()
+    if cleaned.lower() in ("false", "0", "no", "off"):
+        requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+        return False
+    if cleaned.lower() in ("true", "1", "yes", "on"):
+        return True
+    return cleaned
 
 
 def format_field_value(value: Any) -> str:
@@ -161,6 +178,7 @@ def fetch_page(
     field_id: str,
     page_size: int,
     start_at: int,
+    ssl_verify: Union[bool, str],
 ) -> Dict[str, Any]:
     session = requests.Session()
     session.auth = HTTPBasicAuth(cloud_email, cloud_api_token)
@@ -175,6 +193,7 @@ def fetch_page(
             "fields": f"key,{field_id}",
         },
         timeout=60,
+        verify=ssl_verify,
     )
     response.raise_for_status()
     return response.json()
@@ -203,6 +222,7 @@ def fetch_rows(config: Dict[str, Any], start_at: int) -> Tuple[int, List[Tuple[s
         field_id=config["dc_issue_field"],
         page_size=config["page_size"],
         start_at=start_at,
+        ssl_verify=config["ssl_verify"],
     )
     return start_at, rows_from_issues(payload.get("issues", []), config["dc_issue_field"])
 
@@ -257,6 +277,7 @@ def main() -> None:
             field_id=config["dc_issue_field"],
             page_size=config["page_size"],
             start_at=0,
+            ssl_verify=config["ssl_verify"],
         )
 
         total = int(first_payload.get("total", 0))
