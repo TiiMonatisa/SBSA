@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -17,6 +18,7 @@ DEFAULT_JQL = "ORDER BY key ASC"
 PAGE_SIZE = 100
 MAX_RETRIES = 3
 BACKOFF_SECONDS = 2
+CHECKPOINT_VERSION = 1
 
 FIELDNAMES = [
     "dc_issue_key",
@@ -239,6 +241,14 @@ def parse_args() -> argparse.Namespace:
         help=f"CSV output path. Default: {CSV_OUTPUT_FILE}.",
     )
     parser.add_argument(
+        "--checkpoint",
+        default=env("ISSUE_TRANSLATION_CHECKPOINT"),
+        help=(
+            "Resume checkpoint path. Default: <output>.checkpoint.json. "
+            "The CSV is still used to skip rows already written."
+        ),
+    )
+    parser.add_argument(
         "--jql",
         default=env("ISSUE_TRANSLATION_JQL", DEFAULT_JQL),
         help=f"DC JQL used to list source issues. Default: {DEFAULT_JQL!r}.",
@@ -263,6 +273,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Retry rows previously written with status=error instead of treating them as complete.",
     )
+    parser.add_argument(
+        "--ignore-checkpoint",
+        action="store_true",
+        help="Ignore the checkpoint and scan DC from the first page, while still skipping CSV rows already written.",
+    )
     return parser.parse_args()
 
 
@@ -275,11 +290,13 @@ def require_config(args: argparse.Namespace) -> Dict[str, Any]:
         "cloud_email": env("CLOUD_EMAIL", env("JIRA_EMAIL", "")),
         "cloud_api_token": env("CLOUD_API_TOKEN", env("JIRA_API_TOKEN", "")),
         "output_file": args.output,
+        "checkpoint_file": args.checkpoint or f"{args.output}.checkpoint.json",
         "jql": args.jql,
         "page_size": max(args.page_size, 1),
         "dc_ssl_verify": parse_ssl_verify(args.dc_ssl_verify or args.ssl_verify),
         "cloud_ssl_verify": parse_ssl_verify(args.cloud_ssl_verify or "True"),
         "refresh_errors": args.refresh_errors,
+        "ignore_checkpoint": args.ignore_checkpoint,
     }
 
     missing = [
@@ -311,11 +328,82 @@ def load_completed_issue_ids(output_file: str, *, refresh_errors: bool) -> Set[s
     with path.open(newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)
         for row in reader:
-            dc_issue_id = clean_text(row.get("dc_issue_id"))
+            dc_issue_id = clean_text(
+                row.get("dc_issue_id")
+                or row.get("dcIssueId")
+                or row.get("server_issue_id")
+                or row.get("serverIssueId")
+            )
             status = clean_text(row.get("status"))
             if dc_issue_id and (status != "error" or not refresh_errors):
                 completed.add(dc_issue_id)
     return completed
+
+
+def load_checkpoint(
+    checkpoint_file: str,
+    *,
+    output_file: str,
+    jql: str,
+    page_size: int,
+    ignore_checkpoint: bool,
+) -> int:
+    if ignore_checkpoint:
+        return 0
+
+    path = Path(checkpoint_file)
+    if not path.exists():
+        return 0
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Could not read checkpoint {checkpoint_file}: {error}. Starting at page 0.")
+        return 0
+
+    if data.get("version") != CHECKPOINT_VERSION:
+        print(f"Ignoring checkpoint {checkpoint_file}: unsupported version.")
+        return 0
+    if data.get("output_file") != output_file:
+        print(f"Ignoring checkpoint {checkpoint_file}: output file changed.")
+        return 0
+    if data.get("jql") != jql:
+        print(f"Ignoring checkpoint {checkpoint_file}: JQL changed.")
+        return 0
+    if int(data.get("page_size") or 0) != page_size:
+        print(f"Ignoring checkpoint {checkpoint_file}: page size changed.")
+        return 0
+
+    return max(int(data.get("next_start_at") or 0), 0)
+
+
+def save_checkpoint(
+    checkpoint_file: str,
+    *,
+    output_file: str,
+    jql: str,
+    page_size: int,
+    next_start_at: int,
+    total: int,
+    completed_rows: int,
+) -> None:
+    path = Path(checkpoint_file)
+    if str(path.parent) != ".":
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {
+        "version": CHECKPOINT_VERSION,
+        "output_file": output_file,
+        "jql": jql,
+        "page_size": page_size,
+        "next_start_at": next_start_at,
+        "total": total,
+        "completed_rows": completed_rows,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def open_output_writer(output_file: str) -> Tuple[Any, csv.DictWriter]:
@@ -463,12 +551,19 @@ def main() -> None:
         refresh_errors=config["refresh_errors"],
     )
     output_file, writer = open_output_writer(config["output_file"])
+    start_at = load_checkpoint(
+        config["checkpoint_file"],
+        output_file=config["output_file"],
+        jql=config["jql"],
+        page_size=config["page_size"],
+        ignore_checkpoint=config["ignore_checkpoint"],
+    )
 
     print(f"Resuming with {len(completed_issue_ids)} completed DC issue(s).")
     print(f"Writing translation rows to {config['output_file']}")
+    print(f"Using checkpoint {config['checkpoint_file']} from startAt={start_at}")
 
     total = None
-    start_at = 0
     total_written = 0
     total_skipped = 0
 
@@ -497,11 +592,21 @@ def main() -> None:
             total_written += written
             total_skipped += skipped
             processed = min(start_at + config["page_size"], total)
+            next_start_at = start_at + config["page_size"]
+            save_checkpoint(
+                config["checkpoint_file"],
+                output_file=config["output_file"],
+                jql=config["jql"],
+                page_size=config["page_size"],
+                next_start_at=next_start_at,
+                total=total,
+                completed_rows=len(completed_issue_ids),
+            )
             print(
                 f"DC page {start_at}-{processed}: "
                 f"wrote {written}, skipped {skipped}, total {processed}/{total}"
             )
-            start_at += config["page_size"]
+            start_at = next_start_at
     finally:
         output_file.close()
 
